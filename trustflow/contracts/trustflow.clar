@@ -11,6 +11,10 @@
 (define-constant ERR-PROPOSAL-EXISTS (err u106))
 (define-constant ERR-VOTING-ENDED (err u107))
 (define-constant ERR-ALREADY-VOTED (err u108))
+(define-constant ERR-INVALID-TARGET (err u109))
+(define-constant ERR-INVALID-SCORE (err u110))
+(define-constant ERR-INVALID-REASON (err u111))
+(define-constant ERR-INVALID-POINTS (err u112))
 
 (define-constant MINIMUM-REPUTATION-SCORE u500) ;; Out of 1000
 (define-constant REPUTATION-PENALTY u100)
@@ -18,6 +22,9 @@
 (define-constant PROPOSAL-DURATION u1440) ;; ~10 days with 10min blocks
 (define-constant MINIMUM-VOTES-REQUIRED u10)
 (define-constant DAO-THRESHOLD u700) ;; Minimum score to participate in DAO
+(define-constant MAX-REPUTATION-SCORE u1000)
+(define-constant MAX-GOVERNANCE-POINTS u100)
+(define-constant MAX-STAKING-POINTS u100)
 
 ;; Data Maps
 (define-map user-reputation 
@@ -63,6 +70,19 @@
 
 (define-data-var proposal-nonce uint u0)
 
+;; Validation Functions
+(define-private (validate-reputation-score (score uint))
+    (and (>= score u0) (<= score MAX-REPUTATION-SCORE))
+)
+
+(define-private (validate-points (points uint))
+    (<= points MAX-GOVERNANCE-POINTS)
+)
+
+(define-private (validate-target-user (user principal))
+    (is-some (get-reputation user))
+)
+
 ;; DAO Functions
 
 ;; Create an appeal proposal
@@ -75,7 +95,10 @@
         (proposal-id (var-get proposal-nonce))
         (proposer-reputation (unwrap! (get-reputation sender) ERR-NOT-AUTHORIZED))
     )
-        ;; Check if proposer has sufficient reputation
+        ;; Validate inputs
+        (asserts! (validate-target-user target-user) ERR-INVALID-TARGET)
+        (asserts! (validate-reputation-score requested-score) ERR-INVALID-SCORE)
+        (asserts! (not (is-eq reason "")) ERR-INVALID-REASON)
         (asserts! (>= (get score proposer-reputation) DAO-THRESHOLD) ERR-NOT-AUTHORIZED)
         
         ;; Create proposal
@@ -118,7 +141,7 @@
         ;; Update vote counts
         (map-set appeal-proposals proposal-id updated-proposal)
         
-        ;; Update governance participation
+        ;; Update governance participation safely
         (try! (update-reputation-components sender u1 u0))
         (ok true)
     )
@@ -134,6 +157,7 @@
         (asserts! (>= block-height (get end-height proposal)) ERR-NOT-AUTHORIZED)
         (asserts! (not (get executed proposal)) ERR-NOT-AUTHORIZED)
         (asserts! (>= total-votes MINIMUM-VOTES-REQUIRED) ERR-NOT-AUTHORIZED)
+        (asserts! (validate-reputation-score (get requested-score proposal)) ERR-INVALID-SCORE)
         
         ;; Check if proposal passed (simple majority)
         (if (> (get votes-for proposal) (get votes-against proposal))
@@ -153,7 +177,10 @@
 
 ;; Private function to set reputation directly (only called by execute-proposal)
 (define-private (set-reputation (user principal) (new-score uint))
-    (let ((current-reputation (unwrap! (get-reputation user) ERR-NOT-AUTHORIZED)))
+    (let (
+        (current-reputation (unwrap! (get-reputation user) ERR-NOT-AUTHORIZED))
+    )
+        (asserts! (validate-reputation-score new-score) ERR-INVALID-SCORE)
         (ok (map-set user-reputation user
             (merge current-reputation {score: new-score})
         ))
@@ -180,10 +207,16 @@
     (loans-repaid uint) 
     (governance-participation uint)
     (staking-history uint))
-    (let ((base-score (* loans-repaid u100))
-          (governance-bonus (* governance-participation u50))
-          (staking-bonus (* staking-history u50)))
-        (+ (+ base-score governance-bonus) staking-bonus)
+    (let (
+        (base-score (* loans-repaid u100))
+        (governance-bonus (* governance-participation u50))
+        (staking-bonus (* staking-history u50))
+        (total-score (+ (+ base-score governance-bonus) staking-bonus))
+    )
+        (if (> total-score MAX-REPUTATION-SCORE)
+            MAX-REPUTATION-SCORE
+            total-score
+        )
     )
 )
 
@@ -191,19 +224,46 @@
     (user principal)
     (governance-points uint)
     (staking-points uint))
-    (let ((current-reputation (unwrap! (get-reputation user) ERR-NOT-AUTHORIZED)))
-        (ok (map-set user-reputation user
-            {
-                score: (calculate-reputation-score 
-                    (get loans-repaid current-reputation)
-                    (+ (get governance-participation current-reputation) governance-points)
-                    (+ (get staking-history current-reputation) staking-points)
-                ),
-                loans-repaid: (get loans-repaid current-reputation),
-                governance-participation: (+ (get governance-participation current-reputation) governance-points),
-                staking-history: (+ (get staking-history current-reputation) staking-points)
-            }
-        ))
+    (let (
+        (current-reputation (unwrap! (get-reputation user) ERR-NOT-AUTHORIZED))
+    )
+        ;; Validate user exists and inputs
+        (asserts! (validate-target-user user) ERR-INVALID-TARGET)
+        (asserts! (validate-points governance-points) ERR-INVALID-POINTS)
+        (asserts! (validate-points staking-points) ERR-INVALID-POINTS)
+        
+        ;; Validate current values
+        (asserts! (validate-points (get governance-participation current-reputation)) ERR-INVALID-POINTS)
+        (asserts! (validate-points (get staking-history current-reputation)) ERR-INVALID-POINTS)
+        
+        ;; Calculate new values safely
+        (let (
+            (new-governance (+ (get governance-participation current-reputation) governance-points))
+            (new-staking (+ (get staking-history current-reputation) staking-points))
+            (current-loans (get loans-repaid current-reputation))
+        )
+            ;; Additional validation of calculated values
+            (asserts! (validate-points new-governance) ERR-INVALID-POINTS)
+            (asserts! (validate-points new-staking) ERR-INVALID-POINTS)
+            
+            ;; Calculate new score and update state
+            (let (
+                (new-score (calculate-reputation-score 
+                    current-loans
+                    new-governance
+                    new-staking))
+            )
+                (asserts! (validate-reputation-score new-score) ERR-INVALID-SCORE)
+                (ok (map-set user-reputation user
+                    {
+                        score: new-score,
+                        loans-repaid: current-loans,
+                        governance-participation: new-governance,
+                        staking-history: new-staking
+                    }
+                ))
+            )
+        )
     )
 )
 
